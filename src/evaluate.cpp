@@ -33,6 +33,7 @@
 
 #include "nnue/network.h"
 #include "nnue/nnue_misc.h"
+#include "rook_activity_table.h"
 #include "position.h"
 #include "types.h"
 #include "uci.h"
@@ -41,102 +42,64 @@
 namespace Stockfish {
 
 namespace {
+constexpr int DirectionCount = 4;
 
-constexpr double BoardCenter = 4.5;
-constexpr double WeightLogBase = 9.0;
-constexpr double PenaltyLogBase = 2.13157;
-constexpr double MinQuadrantSum = 1e-6;
-
-struct DirectionData {
-    int    count = 0;
-    double xSum  = 0.0;
-    double ySum  = 0.0;
-
-    void add(int fileIndex, int rankIndex) {
-        ++count;
-        const double x = std::abs((fileIndex + 1) - BoardCenter);
-        const double y = std::abs((rankIndex + 1) - BoardCenter);
-        xSum += x;
-        ySum += y;
-    }
-
-    std::pair<double, double> averages() const {
-        if (!count)
-            return {0.0, 0.0};
-        return {xSum / count, ySum / count};
-    }
+struct DirectionOffset {
+    int df;
+    int dr;
 };
 
-DirectionData gather_direction(const Position& pos, Square sq, int df, int dr) {
-    DirectionData data;
-    int           file = int(file_of(sq));
-    int           rank = int(rank_of(sq));
+constexpr std::array<DirectionOffset, DirectionCount> DirectionOffsets = {{{0, 1}, {0, -1}, {-1, 0}, {1, 0}}};
+
+int gather_direction_count(const Position& pos, Square sq, Color color, const DirectionOffset& offset) {
+    int file = int(file_of(sq));
+    int rank = int(rank_of(sq));
+    int count = 0;
 
     while (true)
     {
-        file += df;
-        rank += dr;
+        file += offset.df;
+        rank += offset.dr;
 
         if (file < 0 || file >= 8 || rank < 0 || rank >= 8)
             break;
 
         Square target = make_square(File(file), Rank(rank));
-        data.add(file, rank);
+        Piece  piece  = pos.piece_on(target);
 
-        if (pos.piece_on(target) != NO_PIECE)
+        if (piece == NO_PIECE)
+        {
+            ++count;
+            continue;
+        }
+
+        if (color_of(piece) == color)
             break;
+
+        ++count;  // Capture square
+        break;
     }
 
-    return data;
+    return count;
 }
 
-double directional_weight(double xbar, double ybar) {
-    const double term = 2.0 * (xbar * xbar + ybar * ybar);
-    if (term <= 0.0)
-        return 0.0;
-    static const double logBase = std::log(WeightLogBase);
-    return 2.0 - 0.5 * (std::log(term) / logBase);
+int rook_penalty_scaled_for_square(const Position& pos, Square sq, Color color) {
+    const int up    = gather_direction_count(pos, sq, color, DirectionOffsets[0]);
+    const int down  = gather_direction_count(pos, sq, color, DirectionOffsets[1]);
+    const int left  = gather_direction_count(pos, sq, color, DirectionOffsets[2]);
+    const int right = gather_direction_count(pos, sq, color, DirectionOffsets[3]);
+
+    return RookPenaltyTable[sq][up][down][left][right];
 }
 
-double combine_quadrant(const DirectionData& first, const DirectionData& second) {
-    if (!first.count || !second.count)
-        return 0.0;
-
-    const auto [x1, y1] = first.averages();
-    const auto [x2, y2] = second.averages();
-    const double xbar   = (x1 + x2) * 0.5;
-    const double ybar   = (y1 + y2) * 0.5;
-    const double weight = directional_weight(xbar, ybar);
-
-    return (first.count * second.count) * weight;
-}
-
-double rook_penalty_cp_for_square(const Position& pos, Square sq) {
-    const DirectionData up    = gather_direction(pos, sq, 0, 1);
-    const DirectionData down  = gather_direction(pos, sq, 0, -1);
-    const DirectionData right = gather_direction(pos, sq, 1, 0);
-    const DirectionData left  = gather_direction(pos, sq, -1, 0);
-
-    const double quadrantSum = combine_quadrant(up, right) + combine_quadrant(up, left)
-                             + combine_quadrant(down, right) + combine_quadrant(down, left);
-
-    static const double logBase     = std::log(PenaltyLogBase);
-    static const double penaltyCap  = 4.0 - std::log(MinQuadrantSum) / logBase;
-
-    if (quadrantSum <= 0.0)
-        return penaltyCap;
-
-    return 4.0 - (std::log(quadrantSum) / logBase);
-}
-
-double rook_penalty_cp(const Position& pos, Color c) {
+int rook_penalty_scaled(const Position& pos, Color c) {
     Bitboard rooks = pos.pieces(c, ROOK);
-    double   total = 0.0;
+    int      total = 0;
 
     while (rooks)
     {
         Square sq = pop_lsb(rooks);
-        total += rook_penalty_cp_for_square(pos, sq);
+        total += rook_penalty_scaled_for_square(pos, sq, c);
     }
 
     return total;
@@ -153,12 +116,12 @@ double logistic_scale_a(const Position& pos) {
     return ((as[0] * m + as[1]) * m + as[2]) * m + as[3];
 }
 
-Value cp_to_value(double cp, const Position& pos) {
-    if (cp == 0.0)
+Value scaled_cp_to_value(int cpScaled, const Position& pos) {
+    if (cpScaled == 0)
         return VALUE_ZERO;
 
     const double a = logistic_scale_a(pos);
-    return Value(std::lround(cp * a / 100.0));
+    return Value(std::lround(cpScaled * a / (100.0 * RookPenaltyScale)));
 }
 
 }  // namespace
@@ -206,12 +169,12 @@ Value Eval::evaluate(const Eval::NNUE::Networks&    networks,
     int material = 535 * pos.count<PAWN>() + pos.non_pawn_material();
     int v        = (nnue * (77777 + material) + optimism * (7777 + material)) / 77777;
 
-    const double whitePenaltyCp = rook_penalty_cp(pos, WHITE);
-    const double blackPenaltyCp = rook_penalty_cp(pos, BLACK);
-    const double cpAdjust       = blackPenaltyCp - whitePenaltyCp;
+    const int whitePenaltyScaled = rook_penalty_scaled(pos, WHITE);
+    const int blackPenaltyScaled = rook_penalty_scaled(pos, BLACK);
+    const int cpAdjustScaled     = blackPenaltyScaled - whitePenaltyScaled;
 
-    if (cpAdjust != 0.0)
-        v += cp_to_value(cpAdjust, pos);
+    if (cpAdjustScaled)
+        v += scaled_cp_to_value(cpAdjustScaled, pos);
 
     // Damp down the evaluation linearly when shuffling
     v -= v * pos.rule50_count() / 212;
